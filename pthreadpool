@@ -1,0 +1,382 @@
+#include<unistd.h>
+#include <cstdio>
+#include<sys/socket.h>
+#include<sys/epoll.h>
+#include<arpa/inet.h>
+#include<netinet/in.h>
+#include<fcntl.h>
+#include<pthread.h>
+#include<stdlib.h>
+#include<memory.h>
+#include<iostream>
+
+
+using namespace std;
+
+int epfd;
+pthread_mutex_t mutex_epoll=PTHREAD_MUTEX_INITIALIZER;
+
+//队列不带头节点，队列尾插头出
+#define que_push_item(que,item) do{                      \
+    if(que==nullptr){                                   \
+        que=item;                                       \
+        que->prev=nullptr;                              \
+        que->next=nullptr;                              \
+    }else{                                              \
+        while(que->next!=nullptr){                      \
+            que = que->next;                            \
+        }                                               \
+        que->next=item;                                 \
+        item->next = nullptr;                           \
+        item->prev = que;                               \
+        while(que->prev !=nullptr){                     \
+            que = que->prev;                            \
+        }                                               \
+    }                                                   \
+}while(0)
+
+
+#define que_pop(que) do{                                        \
+    if (que == nullptr) {                                       \
+        break;                                                  \
+    }                                                           \
+    else if (que->next == nullptr) {                            \
+        que = nullptr;                                          \
+    }                                                           \
+    else {                                                      \
+        que = que->next;                                        \
+        que->prev = nullptr;                                    \
+    }                                                           \
+}while(0)
+
+void* worktodo(void*);
+typedef struct Worker_t {//工作线程，创建之后就执行等待任务到来的函数
+    pthread_t tid;
+    void* (*work)(void* arg);
+    void* arg;
+    //int len;指针所指向arg的内存大小
+
+    struct Worker_t *prev;//用于组成队列便于manager管理
+    struct Worker_t* next;
+    Worker_t() {
+        tid = 0;
+        work = worktodo;
+        arg = nullptr;
+        prev = nullptr;
+        next = nullptr;
+        //len = 0;
+    }
+
+}worker_t;
+
+
+
+typedef struct Task_t {//任务，包括任务数据和拿到数据的之后需要执行的函数
+    void* (*task)(void* arg);//任务函数
+    void* arg;//拿到的任务数据
+
+    struct Task_t *prev;//用于组成任务队列，便于manager管理
+    struct Task_t *next;
+    Task_t() {
+        task = nullptr;
+        arg = nullptr;
+        prev = nullptr;
+        next = nullptr;
+    }
+}task_t;
+
+
+
+typedef struct Manager_t {//一个线程池只需要一个管理者所以不需要组成队列
+    void* (*manager)(void* arg);//管理者函数
+    void* arg;//manager参数
+    pthread_t tid;
+
+    Manager_t() {
+        manager = nullptr;
+        arg = nullptr;
+    }
+}manager_t;
+
+
+
+typedef struct PthreadPool_t {
+    worker_t* workers;//工作线程队列
+    task_t* tasks;//任务队列
+    manager_t manager;//管理者
+
+    int min_worker;//最小工作者线程数
+    int max_worker;//最大工作者线程数
+
+    int busy_worker;//正在执行任务的工作线程数，便于管理者动态根据目前的繁忙程度动态调整线程数
+    int now_worker;//现有工作线程数
+
+    pthread_mutex_t mutex;//用于对线程池的互斥修改
+    pthread_cond_t cond_task_arrive;//条件变量，用于等待任务队列不为空的条件而唤醒线程
+    pthread_cond_t cond_change_worker;//条件变量，当线程数应该调整时，唤醒管理者进行对应调整
+
+    int kill;//当线程控线太多时，需要杀死的线程数
+
+    PthreadPool_t() {
+        workers = nullptr;
+        tasks = nullptr;
+        
+        min_worker = 0;
+        max_worker = 0;
+
+        busy_worker = 0;
+        now_worker = 0;
+
+        mutex = PTHREAD_MUTEX_INITIALIZER;
+        cond_change_worker = PTHREAD_COND_INITIALIZER;
+        cond_task_arrive = PTHREAD_COND_INITIALIZER;
+
+        kill = 0;
+    }
+
+
+}pthreadpool_t;
+
+
+worker_t *find(worker_t* que,pthread_t tid) {//查找到tid为指定tid的worker
+    while (que != nullptr) {
+        if (que->tid == tid) {
+            return que;
+        }
+        que = que->next;
+    }
+    return nullptr;
+}
+
+void delworker(worker_t *que,pthread_t tid) {//从worker队列里去掉某一tid为指定tid的worker
+    if (que == nullptr)
+        return;
+    while (que != nullptr) {
+        if (que->tid == tid) {
+            if (que->next)
+                que->next->prev = que->prev;
+            if (que->prev)
+                que->prev->next = que->next;
+            return ;
+        }
+        que = que->next;
+    }
+    return ;
+}
+
+void* worktodo(void* arg) {//线程等待时执行的函数
+    pthreadpool_t* pool = (pthreadpool_t *)arg;
+    //printf("worktodo\n");
+    while(1){
+        pthread_mutex_lock(&(pool->mutex));
+        //cout << "worktodo          pool->now_worker = "<<pool->now_worker << "        pool->busy_worker = " << pool->busy_worker << endl;
+        while (pool->tasks == nullptr) {
+            pthread_cond_wait(&pool->cond_task_arrive, &pool->mutex);
+            if (pool->kill > 0)
+                break;
+        }
+        //printf("worktodo 164\n");
+        if (pool->kill > 0) {
+            pool->kill-=1;
+            pool->now_worker -= 1;
+            pthread_mutex_unlock(&pool->mutex);
+            worker_t *dd = find(pool->workers, gettid());
+            delete dd;
+            delworker(pool->workers, gettid());
+            pthread_exit(0);
+        }
+        task_t *t = pool->tasks;
+        que_pop(pool->tasks);
+        pool->busy_worker += 1;
+        pthread_mutex_unlock(&pool->mutex);
+        t->task(t->arg);
+        delete t;
+        pthread_mutex_lock(&(pool->mutex));
+        pool->busy_worker -= 1;
+        pthread_mutex_unlock(&pool->mutex);
+    }
+    pthread_exit(0);
+}
+
+
+void* manager_todo(void* arg) {
+    pthreadpool_t* pool = (pthreadpool_t*)arg;
+    while (1) {
+        double rate = (double)pool->busy_worker / (double)pool->now_worker;
+        pthread_mutex_lock(&pool->mutex);
+        while (rate > 0.2 && rate < 0.8) {
+            pthread_cond_wait(&pool->cond_change_worker,&pool->mutex);
+            rate = (double)pool->busy_worker / (double)pool->now_worker;
+        }
+        pthread_mutex_unlock(&pool->mutex);
+        if (rate >= 0.8) {
+            for (int i = 0; i < 10; i++) {
+                if (pool->now_worker == pool->max_worker) {
+                    fprintf(stderr, "线程到达峰值，可能出现卡顿现象\n");
+                    break;
+                }
+                worker_t* w = new worker_t;
+                if (w == nullptr) {
+                    perror("new error");
+                    pthread_exit(0);
+                }
+                w->arg = pool;
+                pthread_mutex_lock(&pool->mutex);
+                que_push_item(pool->workers, w);
+                pthread_create(&w->tid, nullptr, w->work, w->arg);
+                pool->now_worker+=1;
+                pthread_mutex_unlock(&pool->mutex);
+            }
+        }
+        else {
+            if (pool->min_worker < pool->now_worker - pool->busy_worker) {
+                pool->kill = pool->now_worker - pool->busy_worker;
+            }
+            else
+                pool->kill = pool->now_worker - pool->min_worker;
+            for (int i = 0; i < pool->kill; i++) {
+                pthread_cond_signal(&pool->cond_task_arrive);
+            }
+        }
+    }
+    pthread_exit(nullptr);
+}
+
+void* task_todo(void* arg) {//用户提供,epoll检测到需要数据到来的通信，子线程来进行一次通信，
+    //所以线程池最大并发量不是看多少个线程同时有连接，而是epoll同时监测到多少个通信连接有数据到来
+    //printf("connect begin\n");
+    struct epoll_event* event = (struct epoll_event *)arg;
+        char buf[128] = "";
+        int len = read(event->data.fd, buf, sizeof(buf));
+        if (len < 0) {
+            perror("read error");
+            pthread_exit(nullptr);
+        }
+        if (len == 0){
+            printf("connect close\n");
+            pthread_mutex_lock(&mutex_epoll);
+            epoll_ctl(epfd, EPOLL_CTL_DEL,event->data.fd,event);
+            pthread_mutex_unlock(&mutex_epoll);
+            delete event;
+            pthread_exit(nullptr);
+        }
+        write(STDOUT_FILENO, buf, len);
+        write(event->data.fd, buf, len);
+        //cout << "connect ssssssssssssssssssssssssssssss" << endl;
+    return nullptr;
+}
+
+void *addtask(pthreadpool_t *pool,void *(*todo)(void *),void *arg){
+    if (arg == nullptr || todo == nullptr) {
+        return (void *)1;
+    }
+    //printf("add task\n");
+    task_t* t = new task_t;
+    t->arg = arg;
+    t->task = todo;
+    pthread_mutex_lock(&pool->mutex);
+    //printf("add task 251\n");
+    que_push_item(pool->tasks, t);
+    pthread_mutex_unlock(&pool->mutex);
+    //printf("add task 252\n");
+    //cout << "add task                pool->now_worker "<<pool->now_worker << "        pool->busy_worker" << pool->busy_worker << endl;
+    pthread_cond_signal(&pool->cond_task_arrive);
+    return nullptr;
+}
+
+
+
+void pthreadpool_init(pthreadpool_t *pool,int minnum, int maxnum) {//根据用户提出的参数对线程池进行初始的设置
+    do {
+        pool->manager.manager = manager_todo;
+        pool->manager.arg = pool;
+        pthread_create(&pool->manager.tid, nullptr, pool->manager.manager, pool->manager.arg);
+        pool->min_worker = minnum;
+        pool->max_worker = maxnum;
+        for (int i = 0; i < minnum; i++) {
+            worker_t* w = new worker_t;
+            if (w == nullptr) {
+                perror("new error");
+                pthread_exit(nullptr);
+            }
+            w->arg = pool; 
+            //pthread_mutex_lock(&pool->mutex);
+            que_push_item(pool->workers, w);//不需要上锁，因为init创建开始还没添加任务，所有线程就算拿到锁也不可能对线程池进行修改
+            pool->now_worker += 1;
+            //pthread_mutex_unlock(&pool->mutex);
+            pthread_create(&w->tid, nullptr, w->work, w->arg);
+        }
+    } while (0);
+
+}
+int main()
+{
+    pthreadpool_t *pool = new pthreadpool_t;
+    pthreadpool_init(pool, 5, 100);
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+
+    struct sockaddr_in myaddr;
+    myaddr.sin_family = AF_INET;
+    myaddr.sin_port = htons(9999);
+    myaddr.sin_addr.s_addr = INADDR_ANY;
+    
+    int ret = bind(lfd, (struct sockaddr*)&myaddr, sizeof(myaddr));
+
+    if (ret < 0) {
+        perror("bind error");
+        exit(1);
+    }
+    ret = listen(lfd, 128);
+    if (ret < 0) {
+        perror("listen error");
+        exit(1);
+    }
+    epfd = epoll_create(1);
+    struct epoll_event evl, evs[64];
+    evl.data.fd = lfd;
+    evl.events = EPOLLIN;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &evl);
+    while (1) {
+        //pthread_mutex_lock(&pool->mutex);
+        int nready = epoll_wait(epfd, evs, sizeof(evs), -1);
+        if (nready < 0) {
+            perror("epoll_wait error");
+            continue;
+        }
+        //cout << "nready = " << nready << endl;
+        for (int i = 0; i < nready;i++) {
+            if (evs[i].data.fd == lfd) {////检测到的监听套接字变化和epoll模型一样，建立连接，上树监听
+                struct sockaddr_in client;
+                socklen_t len = sizeof(client);
+                int fd = accept(lfd, (struct sockaddr*)&client, &len);
+                if (fd < 0) {
+                    perror("accept error");
+                    continue;
+                }
+                char ip[16] = "";
+                printf("client ip = %s,port = %u\n",
+                    inet_ntop(AF_INET, &client.sin_addr.s_addr, ip, 16),
+                    ntohs(client.sin_port));
+                evl.data.fd = fd;
+                evl.events = EPOLLIN|EPOLLET;//epoll监听的需要放到任务队列里的套接字必须设置边沿触发，不然会出现工作线程还没开始执行任务
+                                             //此线程又重新检测该文件描述符的读缓冲区是否有数据，这样一个又会重新放到任务队列
+                pthread_mutex_lock(&mutex_epoll);//因为线程池处理数据时，如果接收到的数据包长度为0，
+                                                 //就要断开连接，节点下树，需要互斥的对epoll红黑树进行操作
+                epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &evl);
+                pthread_mutex_unlock(&mutex_epoll);
+            }
+            else {
+                struct epoll_event *evc = new struct epoll_event;
+                memcpy(evc, &evs[i], sizeof(struct epoll_event));
+                //cout << "-----------------------------------------------------main add task" << endl;
+                addtask(pool, task_todo, evc);
+            }
+        }
+        double rate = (double)pool->busy_worker / (double)pool->now_worker;
+        if (rate <= 0.2 || rate >=0.8) {
+            pthread_cond_signal(&pool->cond_change_worker);
+        }
+    }
+    return 0;
+}
